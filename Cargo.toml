@@ -1,0 +1,18 @@
+[package]
+name = "audio-router"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+# "glow" (OpenGL) : plus léger que wgpu
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
+# "realtime" : priorité temps réel pour les threads audio
+cpal = { version = "0.18.2", features = ["realtime"] }
+ringbuf = "0.4.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
