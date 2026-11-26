@@ -1,1 +1,1 @@
-C:\Users\chart\Downloads\audio-router\target\release\audio-router.exe: C:\Users\chart\Downloads\audio-router\src\main.rs
+C:\Users\chart\Downloads\audio-router\target\release\audio-router.exe: C:\Users\chart\Downloads\audio-router\assets/icon.ico C:\Users\chart\Downloads\audio-router\assets\icon_64.rgba C:\Users\chart\Downloads\audio-router\build.rs C:\Users\chart\Downloads\audio-router\src\main.rs
