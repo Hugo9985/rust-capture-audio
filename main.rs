@@ -10,7 +10,8 @@ use ringbuf::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 const BUFFER_CHOICES: [u32; 5] = [32, 64, 128, 256, 512];
 const DEFAULT_BUFFER_IDX: usize = 2; // 128 images
@@ -69,6 +70,81 @@ fn dev_name(d: &Device) -> String {
     d.description()
         .map(|desc| desc.name().to_string())
         .unwrap_or_else(|_| "Périphérique inconnu".into())
+}
+
+// ---------------------------------------------------------------------------
+// Réglages mémorisés (fichier texte simple, sans dépendance)
+// ---------------------------------------------------------------------------
+#[derive(Clone, PartialEq)]
+struct Settings {
+    input: String,
+    output: String,
+    buffer: u32,
+    gain: f32,
+    autostart: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            output: String::new(),
+            buffer: BUFFER_CHOICES[DEFAULT_BUFFER_IDX],
+            gain: 1.0,
+            autostart: false,
+        }
+    }
+}
+
+fn settings_path() -> PathBuf {
+    if let Some(a) = std::env::var_os("APPDATA") {
+        return PathBuf::from(a).join("AudioRouter").join("settings.ini");
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("settings.ini")))
+        .unwrap_or_else(|| PathBuf::from("settings.ini"))
+}
+
+impl Settings {
+    fn load() -> Self {
+        let mut s = Self::default();
+        if let Ok(text) = std::fs::read_to_string(settings_path()) {
+            for line in text.lines() {
+                let Some((k, v)) = line.split_once('=') else { continue };
+                let v = v.trim();
+                match k.trim() {
+                    "input" => s.input = v.to_string(),
+                    "output" => s.output = v.to_string(),
+                    "buffer" => {
+                        if let Ok(b) = v.parse::<u32>() {
+                            s.buffer = b;
+                        }
+                    }
+                    "gain" => {
+                        if let Ok(g) = v.parse::<f32>() {
+                            s.gain = g.clamp(0.0, 2.0);
+                        }
+                    }
+                    "autostart" => s.autostart = v == "true",
+                    _ => {}
+                }
+            }
+        }
+        s
+    }
+
+    fn save(&self) {
+        let path = settings_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = format!(
+            "input={}\noutput={}\nbuffer={}\ngain={}\nautostart={}\n",
+            self.input, self.output, self.buffer, self.gain, self.autostart
+        );
+        let _ = std::fs::write(path, text);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +324,14 @@ struct App {
     status: String,
     meter_in: f32,
     meter_out: f32,
+    autostart: bool,
+    saved: Settings,
+    dirty_since: Option<Instant>,
 }
 
 impl App {
     fn new() -> Self {
+        let st = Settings::load();
         let mut app = Self {
             inputs: vec![],
             outputs: vec![],
@@ -259,19 +339,39 @@ impl App {
             out_names: vec![],
             in_idx: 0,
             out_idx: 0,
-            buffer_idx: DEFAULT_BUFFER_IDX,
-            gain: 1.0,
+            buffer_idx: BUFFER_CHOICES
+                .iter()
+                .position(|&b| b == st.buffer)
+                .unwrap_or(DEFAULT_BUFFER_IDX),
+            gain: st.gain,
             engine: None,
             shared: Arc::new(Shared::new()),
             status: String::new(),
             meter_in: 0.0,
             meter_out: 0.0,
+            autostart: st.autostart,
+            saved: st.clone(),
+            dirty_since: None,
         };
-        app.refresh_devices();
+        app.shared.gain.store(app.gain.to_bits(), Relaxed);
+        app.refresh_devices(Some(st.input), Some(st.output));
+        if app.autostart {
+            app.start();
+        }
         app
     }
 
-    fn refresh_devices(&mut self) {
+    fn current_settings(&self) -> Settings {
+        Settings {
+            input: self.in_names.get(self.in_idx).cloned().unwrap_or_default(),
+            output: self.out_names.get(self.out_idx).cloned().unwrap_or_default(),
+            buffer: BUFFER_CHOICES[self.buffer_idx],
+            gain: self.gain,
+            autostart: self.autostart,
+        }
+    }
+
+    fn refresh_devices(&mut self, in_pref: Option<String>, out_pref: Option<String>) {
         let host = cpal::default_host();
         self.inputs = host.input_devices().map(|d| d.collect()).unwrap_or_default();
         self.outputs = host.output_devices().map(|d| d.collect()).unwrap_or_default();
@@ -280,11 +380,14 @@ impl App {
 
         let def_in = host.default_input_device().map(|d| dev_name(&d));
         let def_out = host.default_output_device().map(|d| dev_name(&d));
-        self.in_idx = def_in
+        // Priorité : périphérique mémorisé, puis périphérique par défaut de Windows
+        self.in_idx = in_pref
             .and_then(|n| self.in_names.iter().position(|x| *x == n))
+            .or_else(|| def_in.and_then(|n| self.in_names.iter().position(|x| *x == n)))
             .unwrap_or(0);
-        self.out_idx = def_out
+        self.out_idx = out_pref
             .and_then(|n| self.out_names.iter().position(|x| *x == n))
+            .or_else(|| def_out.and_then(|n| self.out_names.iter().position(|x| *x == n)))
             .unwrap_or(0);
     }
 
@@ -356,7 +459,9 @@ impl eframe::App for App {
                         }
                     });
                 if ui.button("Rafraîchir les périphériques").clicked() {
-                    self.refresh_devices();
+                    let ip = self.in_names.get(self.in_idx).cloned();
+                    let op = self.out_names.get(self.out_idx).cloned();
+                    self.refresh_devices(ip, op);
                 }
             });
 
@@ -367,6 +472,8 @@ impl eframe::App for App {
             {
                 self.shared.gain.store(self.gain.to_bits(), Relaxed);
             }
+
+            ui.checkbox(&mut self.autostart, "Démarrer automatiquement au lancement");
 
             ui.add_space(6.0);
             let label = if running { "Arrêter" } else { "Démarrer" };
@@ -393,7 +500,23 @@ impl eframe::App for App {
                 ));
                 ui.small("Si ça craque : augmente le buffer d'un cran.");
             }
+            ui.small("Réglages mémorisés automatiquement (%APPDATA%\\AudioRouter).");
         });
+
+        // Sauvegarde différée : écrit le fichier 0,4 s après le dernier changement
+        let cur = self.current_settings();
+        if cur != self.saved {
+            let t = *self.dirty_since.get_or_insert_with(Instant::now);
+            if t.elapsed() >= Duration::from_millis(400) {
+                cur.save();
+                self.saved = cur;
+                self.dirty_since = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        } else {
+            self.dirty_since = None;
+        }
 
         if self.engine.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));
