@@ -1,6 +1,6 @@
 [package]
 name = "audio-router"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Routeur audio faible latence (entrée vers sortie)"
 
@@ -10,6 +10,10 @@ eframe = { version = "0.37.0", default-features = false, features = ["default_fo
 # "realtime" : priorité temps réel pour les threads audio
 cpal = { version = "0.18.2", features = ["realtime"] }
 ringbuf = "0.4.8"
+
+# Ramener la fenêtre existante au premier plan (instance unique)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 # Icône + métadonnées du .exe (Windows uniquement)
 [target.'cfg(windows)'.build-dependencies]

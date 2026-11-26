@@ -148,6 +148,60 @@ impl Settings {
 }
 
 // ---------------------------------------------------------------------------
+// Instance unique (Windows) : verrou de fichier tenu tant que l'app tourne,
+// libéré automatiquement à la fermeture (même en cas de crash)
+// ---------------------------------------------------------------------------
+const WINDOW_TITLE: &str = "Audio Router";
+
+/// Ok(verrou) = première instance ; Err(()) = une instance tourne déjà.
+#[cfg(windows)]
+fn single_instance() -> Result<Option<std::fs::File>, ()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut path = settings_path();
+    path.set_file_name("instance.lock");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0) // accès exclusif
+        .open(&path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.raw_os_error() == Some(32) => Err(()), // ERROR_SHARING_VIOLATION
+        Err(_) => Ok(None), // autre erreur : on ne bloque pas l'utilisateur
+    }
+}
+
+#[cfg(not(windows))]
+fn single_instance() -> Result<Option<std::fs::File>, ()> {
+    Ok(None)
+}
+
+/// Ramène la fenêtre déjà ouverte au premier plan.
+#[cfg(windows)]
+fn focus_existing_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+    let title: Vec<u16> = WINDOW_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !hwnd.is_null() {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn focus_existing_window() {}
+
+// ---------------------------------------------------------------------------
 // Moteur audio
 // ---------------------------------------------------------------------------
 struct Engine {
@@ -193,19 +247,31 @@ fn build_streams(
             in_cfg.clone(),
             move |data: &[f32], _| {
                 let g = f32::from_bits(sh_in.gain.load(Relaxed));
-                let mut peak_in = 0.0f32;
-                for chunk in data.chunks(in_ch * SCRATCH_FRAMES) {
-                    let mut n = 0;
-                    for src in chunk.chunks_exact(in_ch) {
-                        let dst = &mut scratch[n..n + out_ch];
-                        map_frame(src, dst, g);
-                        for &s in src {
-                            peak_in = peak_in.max(s.abs());
-                        }
-                        n += out_ch;
-                    }
-                    if prod.push_slice(&scratch[..n]) < n {
+                // Niveau d'entrée : une seule passe, vectorisable
+                let peak_in = data.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+
+                if in_ch == out_ch && g == 1.0 {
+                    // Chemin rapide : copie directe, identique bit à bit (aucun calcul)
+                    let free = prod.vacant_len() / out_ch * out_ch;
+                    let take = data.len().min(free);
+                    prod.push_slice(&data[..take]);
+                    if take < data.len() {
                         sh_in.overruns.fetch_add(1, Relaxed);
+                    }
+                } else {
+                    for chunk in data.chunks(in_ch * SCRATCH_FRAMES) {
+                        let mut n = 0;
+                        for src in chunk.chunks_exact(in_ch) {
+                            map_frame(src, &mut scratch[n..n + out_ch], g);
+                            n += out_ch;
+                        }
+                        // On ne pousse que des images entières (jamais de décalage de canaux)
+                        let free = prod.vacant_len() / out_ch * out_ch;
+                        let take = n.min(free);
+                        prod.push_slice(&scratch[..take]);
+                        if take < n {
+                            sh_in.overruns.fetch_add(1, Relaxed);
+                        }
                     }
                 }
                 sh_in.peak_in.fetch_max(peak_in.to_bits(), Relaxed);
@@ -519,12 +585,22 @@ impl eframe::App for App {
         }
 
         if self.engine.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+            let ms = if minimized { 500 } else { 50 };
+            ctx.request_repaint_after(Duration::from_millis(ms));
         }
     }
 }
 
 fn main() -> eframe::Result {
+    let _instance_lock = match single_instance() {
+        Ok(lock) => lock,
+        Err(()) => {
+            focus_existing_window();
+            return Ok(());
+        }
+    };
+
     let icon = egui::IconData {
         rgba: include_bytes!("../assets/icon_64.rgba").to_vec(),
         width: 64,
@@ -538,7 +614,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Audio Router",
+        WINDOW_TITLE,
         options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
